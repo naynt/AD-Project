@@ -1,0 +1,143 @@
+library(tidyverse)
+library(edgeR)
+library(ssizeRNA)
+library(ggrepel)
+library(scales)
+library(plotly)
+library(gprofiler2)
+library(dplyr)
+library(ComplexUpset)
+
+# Set working directory
+setwd("/g/data/xl04/hrp561/adrna")  
+
+# Load raw counts data
+rawcounts <- read_delim("analyses/alnbam/adrawcounts.ensembl", delim = "\t", comment = "#")
+
+# Modify column names to remove '.bam' from sample names
+colnames(rawcounts) <- str_replace(colnames(rawcounts), ".bam", "")
+
+# Load summary counts
+summarycounts <- read_delim("analyses/alnbam/adrawcounts.ensembl.summary", delim = "\t", comment = "#")
+
+# Transform summary counts to long format and clean sample IDs
+summarycounts <- summarycounts %>% 
+  pivot_longer(-1, names_to = "sampleid") %>%
+  filter(value != 0) %>% 
+  mutate(sampleid = str_replace(sampleid, ".bam", ""))
+
+# Create a data frame with additional information about the samples
+sinfo <- summarycounts %>% 
+  pivot_wider(names_from = "Status", values_from = "value") %>% 
+  mutate(totalcounts = Assigned + Unassigned_Unmapped + Unassigned_NoFeatures,
+         libsize = Assigned + Unassigned_NoFeatures,
+         sex = case_when(str_detect(sampleid, "_F_") ~ "female", TRUE ~ "male"), 
+         stype = case_when(str_detect(sampleid, "Control") ~ "ctrl", TRUE ~ "AD"))
+
+# Load gene annotation data and merge with raw counts
+geneinfo <- read_delim("reference/ensembl.geneinfo", delim = "\t", col_names = FALSE)
+colnames(geneinfo) <- c("Geneid", "GeneName", "Chr", "Start", "End")
+geneinfo <- left_join(geneinfo, rawcounts[, c(1, 6, 7)], by = "Geneid")
+
+# Create DGEList object for differential gene expression analysis
+y <- DGEList(counts = as.matrix(rawcounts[, 8:ncol(rawcounts)]), 
+             genes = as.data.frame(geneinfo), 
+             lib.size = pull(sinfo, libsize),
+             group = mutate(sinfo, group = paste(sex, stype, sep = ".")) %>% pull(group),
+             samples = sinfo,
+             remove.zeros = TRUE)
+
+# Filter genes with low counts
+keep <- filterByExpr(y, group = y$samples$group)
+y <- y[keep,]
+
+# Normalize library sizes
+y <- normLibSizes(y)
+
+# Perform MDS plot to visualize similarity between RNA-seq samples
+plotMDS(cpm(y, normalized.lib.sizes = TRUE, log = TRUE), top = 1000, labels = y$samples$stype)
+
+# Compute log-transformed CPM values
+logcpm <- cpmByGroup(y, normalized.lib.sizes = TRUE, log = TRUE, group = y$samples$group)
+logcpm <- as.data.frame(logcpm)
+logcpm <- bind_cols(logcpm, y$genes)
+logcpm <- as_tibble(logcpm)
+
+# Differential expression analysis using GLM approach
+design <- model.matrix(~0 + group, data = y$samples)
+colnames(design) <- levels(y$samples$group)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+# Female AD vs. Female Control
+females <- glmQLFTest(fit, contrast = c(-1, 1, 0, 0))
+fc <- topTags(females, p.value = 0.05, n = 1e6)
+
+# Male AD vs. Male Control
+males <- glmQLFTest(fit, contrast = c(0, 0, 1, -1))
+fc <- topTags(males, p.value = 0.05, n = 1e6)
+
+# Control vs. AD in both sexes
+ctrl <- glmQLFTest(fit, contrast = c(0, -1, 0, 1))
+fc <- topTags(ctrl, p.value = 0.05, n = 1e6)
+
+ad <- glmQLFTest(fit, contrast = c(-1, 0, 1, 0))
+fc <- topTags(ad, p.value = 0.05, n = 1e6)
+
+# Prepare data for UpSet plot
+df <- logcpm %>%
+  mutate(
+    GeneName = ifelse(is.na(GeneName) | GeneName == "", "Unknown", GeneName),
+    mlogfc = male.AD - male.ctrl, 
+    flogfc = female.AD - female.ctrl
+  ) %>%
+  dplyr::select(GeneName, mlogfc, flogfc)
+
+# Apply FDR correction for both male and female comparisons
+df <- df %>%
+  mutate(
+    male_fdr = p.adjust(mlogfc, method = "fdr"),
+    female_fdr = p.adjust(flogfc, method = "fdr")
+  )
+
+# Filter based on FDR and fold change thresholds
+fdr_threshold <- 0.05
+fc_threshold <- 2
+
+df_filtered <- df %>%
+  filter(
+    (male_fdr < fdr_threshold | female_fdr < fdr_threshold) &
+      (abs(mlogfc) >= fc_threshold | abs(flogfc) >= fc_threshold)
+  )
+
+# Add up/down regulation categories
+df_filtered <- df_filtered %>%
+  mutate(
+    male_up = ifelse(mlogfc >= fc_threshold, "Upregulated", "Not Upregulated"),
+    male_down = ifelse(mlogfc <= -fc_threshold, "Downregulated", "Not Downregulated"),
+    female_up = ifelse(flogfc >= fc_threshold, "Upregulated", "Not Upregulated"),
+    female_down = ifelse(flogfc <= -fc_threshold, "Downregulated", "Not Downregulated")
+  )
+
+# Create a binary data frame for ComplexUpset
+binary_df <- df_filtered %>%
+  transmute(
+    GeneName = GeneName,
+    Male_Up = male_up == "Upregulated",
+    Male_Down = male_down == "Downregulated",
+    Female_Up = female_up == "Upregulated",
+    Female_Down = female_down == "Downregulated"
+  )
+
+# Convert GeneName to row names for ComplexUpset
+rownames(binary_df) <- NULL
+binary_df <- column_to_rownames(binary_df, var = "GeneName")
+
+# Generate UpSet plot
+upset_plot <- ComplexUpset::upset(
+  data = binary_df,
+  intersect = c("Male_Up", "Male_Down", "Female_Up", "Female_Down")
+)
+
+# Display the plot
+print(upset_plot)
