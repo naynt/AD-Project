@@ -1,0 +1,68 @@
+library(tidyverse)
+library(edgeR)
+library(ssizeRNA)
+library(ggrepel)
+library(scales)
+
+
+setwd("/g/data/xl04/hrp561/adrna/")
+
+rawcounts <- read_delim("analyses/alnbam/adrawcounts.ensembl", delim = "\t", comment = "#")
+colnames(rawcounts) <- str_replace(colnames(rawcounts), ".bam", "")
+summarycounts <- read_delim("analyses/alnbam/adrawcounts.ensembl.summary", delim = "\t", comment = "#")
+summarycounts <- summarycounts %>% pivot_longer(-1, names_to = "sampleid") %>% filter(value != 0) %>% mutate(sampleid = str_replace(sampleid, ".bam", ""))
+
+sinfo <- summarycounts %>% pivot_wider(names_from = "Status", values_from = "value") %>% 
+  mutate(totalcounts = Assigned + Unassigned_Unmapped + Unassigned_NoFeatures,
+         libsize = Assigned + Unassigned_NoFeatures,
+         sex = case_when(str_detect(sampleid, "_F_") ~ "female", TRUE ~ "male"), 
+         stype = case_when(str_detect(sampleid, "Control") ~ "ctrl", TRUE ~ "AD"))
+
+geneinfo <- read_delim("reference/ensembl.geneinfo", delim = "\t", col_names = F)
+colnames(geneinfo) <- c("Geneid", "GeneName", "Chr", "Start", "End")
+geneinfo <- left_join(geneinfo, select(rawcounts, c(1,6,7)))
+
+y <- DGEList(counts = rawcounts %>% select(c(8:ncol(rawcounts))) %>% as.matrix(), 
+             genes = as.data.frame(geneinfo), 
+             lib.size = pull(sinfo, libsize),
+             group = mutate(sinfo, group = paste(sex,stype,sep=".")) %>% pull(group),
+             samples = sinfo,
+             remove.zeros = T)
+keep <- filterByExpr(y, group = y$samples$group)
+y <- y[keep,]
+y <- normLibSizes(y)
+
+plotMDS(cpm(y, normalized.lib.sizes = T, log = T), top = 1000, labels = y$samples$stype)
+
+logcpm <- cpmByGroup(y, normalized.lib.sizes = T, log = T, group = y$samples$group)
+logcpm <- as.data.frame(logcpm)
+logcpm <- bind_cols(logcpm, y$genes)
+logcpm <- as_tibble(logcpm)
+logcpm %>% mutate(mlogfc = male.AD - male.ctrl, flogfc = female.AD - female.ctrl) %>% 
+  filter(Chr == "chrX") %>%
+  select(Chr,Start, mlogfc, flogfc) %>% 
+  pivot_longer(cols = - c("Chr", "Start"), names_to = "sex", values_to = "logfc") %>% 
+  ggplot(aes(x=Start, y = logfc, color = sex)) + 
+  geom_point() + 
+  geom_smooth()
+
+##https://www.bioconductor.org/packages/devel/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf
+##3.2.3 GLM approach
+
+design <- model.matrix(~0+group, data=y$samples)
+colnames(design) <- levels(y$samples$group)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+females <- glmQLFTest(fit, contrast=c(-1,1,0,0))
+fc <- topTags(females, p.value = 0.05, n = 1e6)
+
+males <- glmQLFTest(fit, contrast=c(0,0,1,-1))
+fc <- topTags(males, p.value = 0.05, n = 1e6)
+
+ctrl <- glmQLFTest(fit, contrast=c(0,-1,0,1))
+fc <- topTags(ctrl, p.value = 0.05, n = 1e6)
+
+ad <- glmQLFTest(fit, contrast=c(-1,0,1,0))
+fc <- topTags(ad, p.value = 0.05, n = 1e6)
+
