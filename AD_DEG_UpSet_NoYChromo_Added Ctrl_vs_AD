@@ -1,0 +1,126 @@
+# Load required libraries
+library(tidyverse)
+library(edgeR)
+library(ggrepel)
+library(ComplexUpset)
+
+# Set working directory
+setwd("/g/data/xl04/hrp561/adrna")
+
+# Load raw counts data
+rawcounts <- read_delim("analyses/alnbam/adrawcounts.ensembl", delim = "\t", comment = "#")
+
+# Clean up column names by removing ".bam" (fixed to handle multiple dots in filenames)
+colnames(rawcounts) <- str_replace(colnames(rawcounts), fixed(".bam"), "")
+
+# Load summary counts
+df_summary <- read_delim("analyses/alnbam/adrawcounts.ensembl.summary", delim = "\t", comment = "#") %>%
+  pivot_longer(-1, names_to = "sampleid") %>%
+  filter(value != 0) %>%
+  mutate(sampleid = str_replace(sampleid, fixed(".bam"), ""))
+
+# Inspect column names in df_summary
+print(colnames(df_summary))
+
+# Create sample information dataframe
+sinfo <- df_summary %>%
+  pivot_wider(names_from = "Status", values_from = "value") %>%
+  mutate(
+    totalcounts = Assigned + Unassigned_Unmapped + Unassigned_NoFeatures,  # Adjust based on actual columns
+    libsize = Assigned + Unassigned_NoFeatures,  # Adjust based on actual columns
+    sex = case_when(str_detect(sampleid, "_F_") ~ "female", TRUE ~ "male"),
+    stype = case_when(str_detect(sampleid, "Control") ~ "ctrl", TRUE ~ "AD")
+  )
+
+# Load gene annotation
+geneinfo <- read_delim("reference/ensembl.geneinfo", delim = "\t", col_names = FALSE) %>%
+  rename(Geneid = X1, GeneName = X2, Chr = X3, Start = X4, End = X5) %>%
+  left_join(rawcounts[, c(1, 6, 7)], by = "Geneid") %>%
+  filter(Chr != "Y")  # Exclude Y-chromosome genes
+
+# Create DGEList
+y <- DGEList(
+  counts = as.matrix(rawcounts[, 8:ncol(rawcounts)]),
+  genes = as.data.frame(geneinfo),
+  lib.size = pull(sinfo, libsize),  # Use updated libsize
+  group = sinfo %>% mutate(group = paste(sex, stype, sep = ".")) %>% pull(group),
+  samples = sinfo
+)
+
+# Filter low-expressed genes
+y <- y[filterByExpr(y, group = y$samples$group), ]
+
+# Normalize library sizes
+y <- calcNormFactors(y)
+
+# Define design matrix
+design <- model.matrix(~0 + group, data = y$samples)
+colnames(design) <- levels(y$samples$group)
+
+# Estimate dispersions and fit GLM
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+# Perform DE analysis for Female AD vs. Female Control
+females <- glmQLFTest(fit, contrast = c(-1, 1, 0, 0))  # Female AD vs. Female Control
+fc_females <- topTags(females, p.value = 1, n = 1e6)$table %>% mutate(fdr_female = p.adjust(PValue, method = "fdr"))
+
+# Perform DE analysis for Male AD vs. Male Control
+males <- glmQLFTest(fit, contrast = c(0, 0, 1, -1))    # Male AD vs. Male Control
+fc_males <- topTags(males, p.value = 1, n = 1e6)$table %>% mutate(fdr_male = p.adjust(PValue, method = "fdr"))
+
+# Perform DE analysis for Control vs. AD (combining sexes)
+contrast_control_vs_ad <- c(-0.5, -0.5, 0.5, 0.5)  # Control vs. AD contrast
+control_vs_ad <- glmQLFTest(fit, contrast = contrast_control_vs_ad)
+fc_control_vs_ad <- topTags(control_vs_ad, p.value = 1, n = 1e6)$table %>% mutate(fdr_control_vs_ad = p.adjust(PValue, method = "fdr"))
+
+# Merge results
+df <- full_join(fc_females, fc_males, by = "Geneid", suffix = c("_female", "_male")) %>%
+  full_join(fc_control_vs_ad, by = "Geneid", suffix = c("", "_control_vs_ad"))
+
+# Set thresholds
+fdr_threshold <- 0.05
+fc_threshold <- log2(2)  # Log2 fold-change threshold
+
+# Filter based on relaxed criteria (separate filters for P-value, FDR, and logFC)
+df_filtered <- df %>%
+  filter(
+    (PValue_female < 0.05 | PValue_male < 0.05 | PValue < 0.05),  # P-value filter
+    (fdr_female < fdr_threshold | fdr_male < fdr_threshold | fdr_control_vs_ad < fdr_threshold)  # FDR filter
+  ) %>%
+  mutate(
+    female_up = logFC_female >= fc_threshold,
+    female_down = logFC_female <= -fc_threshold,
+    male_up = logFC_male >= fc_threshold,
+    male_down = logFC_male <= -fc_threshold,
+    control_vs_ad_up = logFC >= fc_threshold,
+    control_vs_ad_down = logFC <= -fc_threshold
+  ) %>%
+  filter(
+    female_up | female_down | male_up | male_down | control_vs_ad_up | control_vs_ad_down  # Exclude genes with no significant changes
+  )
+
+# Prepare binary dataframe for UpSet plot
+binary_df <- df_filtered %>%
+  transmute(
+    GeneName = Geneid,
+    Female_Up = female_up,
+    Female_Down = female_down,
+    Male_Up = male_up,
+    Male_Down = male_down,
+    Control_vs_AD_Up = control_vs_ad_up,
+    Control_vs_AD_Down = control_vs_ad_down
+  )
+
+rownames(binary_df) <- binary_df$GeneName
+binary_df <- binary_df %>% select(-GeneName)
+
+# Generate UpSet plot
+upset_plot <- ComplexUpset::upset(
+  data = binary_df,
+  intersect = c("Female_Up", "Female_Down", "Male_Up", "Male_Down", "Control_vs_AD_Up", "Control_vs_AD_Down")
+)
+
+# Display the plot
+print(upset_plot)
+
